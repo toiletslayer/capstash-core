@@ -1,0 +1,79 @@
+name: CAP x402 regtest live
+on:
+  push:
+    branches:
+      - x402-regtest-ci-20260918
+
+jobs:
+  regtest:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download and verify official CapStash v27.1.0 CLI
+        shell: bash
+        run: |
+          set -euxo pipefail
+          URL="https://github.com/CapStash/CapStash-Core/releases/download/v27.1.0/CapStash-27.1.0-x86_64-pc-linux-gnu-cli.tar.gz"
+          curl -fL --retry 4 --retry-delay 2 "$URL" -o "$RUNNER_TEMP/capstash.tar.gz"
+          echo "c838622ad29fbac1231263894c946d117b3110d5e24acab5bedf75e79ee954dd  $RUNNER_TEMP/capstash.tar.gz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/capbin"
+          tar -xzf "$RUNNER_TEMP/capstash.tar.gz" -C "$RUNNER_TEMP/capbin"
+          find "$RUNNER_TEMP/capbin" -type f -maxdepth 5 -print
+          DAEMON="$(find "$RUNNER_TEMP/capbin" -type f \( -name 'capstashd' -o -name 'CapStashd' -o -name '*stashd' \) | head -n1)"
+          CLI="$(find "$RUNNER_TEMP/capbin" -type f \( -name 'capstash-cli' -o -name 'CapStash-cli' -o -name '*stash-cli' \) | head -n1)"
+          test -n "$DAEMON"
+          test -n "$CLI"
+          chmod +x "$DAEMON" "$CLI"
+          echo "CAP_DAEMON=$DAEMON" >> "$GITHUB_ENV"
+          echo "CAP_CLI=$CLI" >> "$GITHUB_ENV"
+          "$DAEMON" --version || true
+          "$CLI" --version || true
+
+      - name: Start isolated regtest node and wallet
+        shell: bash
+        run: |
+          set -euxo pipefail
+          DATADIR="$RUNNER_TEMP/cap-regtest"
+          mkdir -p "$DATADIR"
+          echo "CAP_DATADIR=$DATADIR" >> "$GITHUB_ENV"
+          "$CAP_DAEMON" -regtest -datadir="$DATADIR" -server=1 -rpcuser=x402 -rpcpassword=x402-test-only -daemon
+          for i in $(seq 1 60); do
+            if "$CAP_CLI" -regtest -datadir="$DATADIR" -rpcuser=x402 -rpcpassword=x402-test-only getblockchaininfo >/tmp/chain.json 2>/tmp/rpc.err; then break; fi
+            sleep 1
+          done
+          cat /tmp/chain.json
+          "$CAP_CLI" -regtest -datadir="$DATADIR" -rpcuser=x402 -rpcpassword=x402-test-only createwallet x402
+          cat > "$RUNNER_TEMP/capcli" <<EOF
+          #!/usr/bin/env bash
+          exec "$CAP_CLI" -datadir="$DATADIR" -rpcuser=x402 -rpcpassword=x402-test-only -rpcwallet=x402 "$@"
+          EOF
+          chmod +x "$RUNNER_TEMP/capcli"
+          echo "CAP_WRAPPER=$RUNNER_TEMP/capcli" >> "$GITHUB_ENV"
+          "$RUNNER_TEMP/capcli" -regtest getblockhash 0
+          "$RUNNER_TEMP/capcli" -regtest getwalletinfo
+
+      - name: Run included positive regtest harness
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 x402-tests/regtest_live_check.py --cli "$CAP_WRAPPER" | tee positive.log
+
+      - name: Run live negative cases
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 x402-tests/live_negative_cases.py --cli "$CAP_WRAPPER" | tee negative.log
+
+      - name: Node diagnostics
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          echo "=== blockchain ==="
+          "$CAP_WRAPPER" -regtest getblockchaininfo
+          echo "=== mempool ==="
+          "$CAP_WRAPPER" -regtest getrawmempool true
+          echo "=== debug tail ==="
+          tail -n 200 "$CAP_DATADIR/regtest/debug.log" || true
